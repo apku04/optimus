@@ -29,6 +29,7 @@ class OledDisplayNode(Node):
         
         self.printer_status = {}
         self.sensor_data = {}
+        self.vision_status = "Wait"
         self.bus = None
         
         # Initialize I2C Bus for Mux Control
@@ -54,6 +55,7 @@ class OledDisplayNode(Node):
 
         # Subscribers
         self.create_subscription(String, 'printer/status', self.printer_status_cb, 10)
+        self.create_subscription(String, '/vision_status', self.vision_status_cb, 10)
         
         # Subscribe to known sensors
         self.create_subscription(Temperature, 'sensors/rpi_case/temperature', 
@@ -82,6 +84,12 @@ class OledDisplayNode(Node):
             except Exception as e:
                 self.get_logger().warn(f"Mux disable failed: {e}")
 
+    def vision_status_cb(self, msg):
+        if "Active" in msg.data:
+            self.vision_status = "OK"
+        else:
+            self.vision_status = "Err"
+
     def printer_status_cb(self, msg):
         try:
             self.printer_status = json.loads(msg.data)
@@ -99,7 +107,7 @@ class OledDisplayNode(Node):
             self.enable_mux()
             with canvas(self.device) as draw:
                 # Draw header
-                draw.text((0, 0), "Optimus Robot", fill="white")
+                draw.text((0, 0), f"Optimus | Vis:{self.vision_status}", fill="white")
                 draw.line((0, 12, 127, 12), fill="white")
                 
                 y = 14

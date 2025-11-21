@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from sensor_msgs.msg import Temperature
 from std_msgs.msg import String, Float32
 import json
 import os
 import time
+import subprocess
 from datetime import datetime
 from ament_index_python.packages import get_package_share_directory
 from .sensor_reader import SensorReader
@@ -67,9 +69,22 @@ class OptimusHardwareNode(Node):
                         self.fan_publishers_[fan_name] = self.create_publisher(Float32, fan_topic, 10)
 
         # --- Subscribers (OLED Data) ---
-        self.printer_status = {}
+        self.robot_status = {}
         self.sensor_data = {} # Local cache for display
-        self.create_subscription(String, 'printer/status', self.printer_status_cb, 10)
+        self.vision_status = "Wait"
+        self.vision_last_seen = time.time()
+        self.vision_timeout = 5.0  # seconds
+        self.diag_status = "OK"
+        self.diag_failures = []
+        self.create_subscription(String, 'printer/status', self.robot_status_cb, 10)
+        self.create_subscription(String, '/vision_status', self.vision_status_cb, 10)
+        
+        # Create latched publisher for diagnostics (transient local)
+        diag_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.diag_pub = self.create_publisher(String, '/diagnostics/result', diag_qos)
+
+        # Run Diagnostics on Boot
+        self.run_system_diagnostics()
         
                 # --- OLED Setup ---
         self.oled_device = None
@@ -106,27 +121,89 @@ class OptimusHardwareNode(Node):
         self.timer = self.create_timer(1.0, self.control_loop)
         self.last_sensor_read = 0
         self.sensor_interval = self.config['settings'].get('poll_interval', 5.0)
+        self.blink_state = False
         
         self.get_logger().info("Optimus Hardware Node started")
 
-    def printer_status_cb(self, msg):
+    def run_system_diagnostics(self):
         try:
-            self.printer_status = json.loads(msg.data)
+            self.get_logger().info("Running system diagnostics...")
+            result = subprocess.run(
+                ['/home/acp/rpi-robot-diagnostics/run_diagnostics.py'],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            
+            msg = String()
+            msg.data = result.stdout
+            self.diag_pub.publish(msg)
+
+            if result.returncode == 0:
+                self.diag_status = "OK"
+                self.diag_failures = []
+                self.get_logger().info("System Diagnostics Passed")
+            else:
+                self.diag_status = "Fail"
+                self.diag_failures = self.parse_diagnostic_failures(result.stdout)
+                self.get_logger().error(f"System Diagnostics Failed:\n{result.stdout}")
+                
+        except Exception as e:
+            self.diag_status = "Err"
+            self.diag_failures = ["Diag script error"]
+            self.get_logger().error(f"Failed to run diagnostics: {e}")
+
+    def parse_diagnostic_failures(self, output):
+        failures = []
+        lines = output.split('\n')
+        for line in lines:
+            # Look for lines in the summary that start with checkmark and contain test names
+            if 'USB Microphone:' in line or 'Temperature Sensors:' in line or 'OLED' in line or 'Motor Controller' in line or 'I2C Multiplexer' in line:
+                if 'FAIL' in line or 'Cannot test' in line or 'missing' in line or line.strip().startswith('✗'):
+                    # Extract just the test name and clean simple reason
+                    if 'USB Microphone' in line:
+                        failures.append("Mic: missing deps")
+                    elif 'Temperature Sensors' in line:
+                        failures.append("Temp sensors fail")
+                    elif 'OLED' in line and 'FAIL' in line:
+                        failures.append("OLED fail")
+                    elif 'Motor Controller' in line or 'Klipper' in line:
+                        failures.append("Motor fail")
+        return failures if failures else ["Check diag log"]
+
+    def robot_status_cb(self, msg):
+        try:
+            self.robot_status = json.loads(msg.data)
         except:
             pass
+
+    def vision_status_cb(self, msg):
+        self.vision_last_seen = time.time()
+        if "Active" in msg.data:
+            self.vision_status = "OK"
+        else:
+            self.vision_status = "Err"
 
     def control_loop(self):
         now = time.time()
         
-        # 1. Read Sensors (if interval passed)
+        # 0. Toggle blink state for animations
+        self.blink_state = not self.blink_state
+        
+        # 1. Check vision timeout
+        if now - self.vision_last_seen > self.vision_timeout:
+            if self.vision_status != "Wait":
+                self.vision_status = "Lost"
+        
+        # 2. Read Sensors (if interval passed)
         if now - self.last_sensor_read >= self.sensor_interval:
             self.read_sensors()
             self.last_sensor_read = now
             
-        # 2. Update OLED (every loop)
+        # 3. Update OLED (every loop)
         self.update_display()
         
-        # 3. Ensure Mux is disabled when idle (optional, but good for safety)
+        # 4. Ensure Mux is disabled when idle (optional, but good for safety)
         self.sensor_reader.disable_mux_channels()
 
     def read_sensors(self):
@@ -183,6 +260,17 @@ class OptimusHardwareNode(Node):
             # Always disable mux after reading sensors to free bus for OLED (if it was shared)
             self.sensor_reader.disable_mux_channels()
 
+    def get_status_symbol(self, status):
+        """Return visual symbol for status"""
+        if status == "OK":
+            return "[OK]"
+        elif status in ["Err", "Lost"]:
+            return "[!!]" if self.blink_state else "[XX]"
+        elif status == "Wait":
+            return "[..]"
+        else:
+            return "[??]"
+
     def update_display(self):
         if not self.oled_device:
             return
@@ -191,35 +279,108 @@ class OptimusHardwareNode(Node):
             # OLED is on main bus, no mux switch needed
             # self.sensor_reader.select_mux_channel(self.oled_channel)
             
-            # Get Printer Status String
-            printer_state = "Unknown"
-            if self.printer_status:
-                stats = self.printer_status.get('print_stats', {})
-                printer_state = stats.get('state', 'Unknown')
+            # Get Motor Controller Status String
+            motor_state = "Unknown"
+            if self.robot_status:
+                stats = self.robot_status.get('print_stats', {})
+                motor_state = stats.get('state', 'Unknown')
+                # Map printer states to robot terms
+                if motor_state == 'ready':
+                    motor_state = "Ready"
+                elif motor_state == 'standby':
+                    motor_state = "Standby"
+                elif motor_state == 'printing':
+                    motor_state = "Moving"
 
             with canvas(self.oled_device) as draw:
-                # Explicitly clear the screen with a black rectangle
+                # Explicitly clear the screen
                 draw.rectangle(self.oled_device.bounding_box, outline="black", fill="black")
 
-                # --- Header Section (User Preferred Layout) ---
-                draw.text((0, 0), "=== OPTIMUS ===", fill="white")
-                draw.text((0, 12), f"Status: {printer_state}", fill="white")
-                draw.text((0, 24), f"Time: {datetime.now().strftime('%H:%M:%S')}", fill="white")
+                # --- HEADER: Title and Time (Line 0-10) ---
+                draw.text((0, 0), "OPTIMUS", fill="white")
+                draw.text((85, 0), datetime.now().strftime('%H:%M'), fill="white")
+                draw.line((0, 10, 127, 10), fill="white")
+                
+                # --- STATUS ROW 1: Vision (Line 12-22) ---
+                vision_symbol = self.get_status_symbol(self.vision_status)
+                if self.vision_status in ["Err", "Lost"]:
+                    # Blink error
+                    if self.blink_state:
+                        draw.rectangle((0, 12, 60, 22), outline="white", fill="white")
+                        draw.text((2, 13), f"VIS {vision_symbol}", fill="black")
+                    else:
+                        draw.text((0, 13), f"VIS {vision_symbol}", fill="white")
+                else:
+                    draw.text((0, 13), f"VIS {vision_symbol}", fill="white")
+                
+                # --- STATUS ROW 2: Motion (Line 24-34) ---
+                motion_short = motor_state[:7] if len(motor_state) > 7 else motor_state
+                draw.text((0, 25), f"MOT: {motion_short}", fill="white")
+                
+                # --- DIAG STATUS (Right side, line 13-34) ---
+                if self.diag_status != "OK":
+                    if self.blink_state:
+                        draw.rectangle((95, 12, 127, 34), outline="white", fill="white")
+                        draw.text((100, 18), "DIAG", fill="black")
+                        draw.text((100, 26), "ERR!", fill="black")
+                    else:
+                        draw.rectangle((95, 12, 127, 34), outline="white", fill="black")
+                        draw.text((100, 18), "DIAG", fill="white")
+                        draw.text((100, 26), "ERR!", fill="white")
+                else:
+                    draw.rectangle((95, 12, 127, 34), outline="white", fill="black")
+                    draw.text((102, 20), "OK", fill="white")
+                
                 draw.line((0, 36, 127, 36), fill="white")
                 
-                y = 40
-                # --- Sensor Data Section ---
+                # --- TEMPERATURE SECTION (Line 38-90) ---
+                y = 38
                 for name, temp in self.sensor_data.items():
-                    draw.text((0, y), f"{name}: {temp:.1f}C", fill="white")
-                    y += 10
+                    # Determine warning level
+                    warn_level = ""
+                    if temp > 65:
+                        warn_level = "!" if self.blink_state else "X"
+                    elif temp > 55:
+                        warn_level = "!"
+                    elif temp > 45:
+                        warn_level = "~"
+                    
+                    # Format with aligned columns
+                    name_padded = f"{name:3s}"
+                    temp_str = f"{temp:5.1f}"
+                    draw.text((2, y), f"{warn_level:1s}{name_padded} {temp_str}C", fill="white")
+                    y += 11
                 
-                # --- Printer Temps (Bed/Extruder) ---
-                if self.printer_status:
-                    bed = self.printer_status.get('heater_bed', {})
-                    ext = self.printer_status.get('extruder', {})
-                    if bed and ext:
-                        y += 10
-                        draw.text((0, y), f"Bed:{bed.get('temperature',0):.0f}C Ext:{ext.get('temperature',0):.0f}C", fill="white")
+                # --- MOTOR DRIVER TEMPS (if available) ---
+                if self.robot_status:
+                    driver_temps = self.robot_status.get('temperature_sensor', {})
+                    # Check for common motor driver temp sensors
+                    temp1 = None
+                    temp2 = None
+                    
+                    # Try to get heater_bed/extruder as generic temp inputs
+                    if 'heater_bed' in self.robot_status:
+                        temp1 = self.robot_status['heater_bed'].get('temperature', 0)
+                    if 'extruder' in self.robot_status:
+                        temp2 = self.robot_status['extruder'].get('temperature', 0)
+                    
+                    if temp1 is not None and temp2 is not None:
+                        draw.line((0, y, 127, y), fill="white")
+                        y += 2
+                        draw.text((2, y), f"M1  {temp1:5.1f}C", fill="white")
+                        draw.text((68, y), f"M2  {temp2:5.1f}C", fill="white")
+                        y += 11
+                
+                # --- DIAGNOSTIC ERROR BOX (Bottom, if needed) ---
+                if self.diag_status != "OK" and self.diag_failures:
+                    # Position at bottom
+                    box_top = 115
+                    draw.line((0, box_top-2, 127, box_top-2), fill="white")
+                    if self.blink_state:
+                        draw.rectangle((0, box_top, 127, 127), outline="white", fill="white")
+                        draw.text((2, box_top+1), f"{self.diag_failures[0][:20]}", fill="black")
+                    else:
+                        draw.text((2, box_top+1), f"!{self.diag_failures[0][:19]}", fill="white")
                         
         except Exception as e:
             self.get_logger().warn(f"OLED update failed: {e}")
