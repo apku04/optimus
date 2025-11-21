@@ -1,0 +1,73 @@
+{
+  "sensors": [
+    {
+      "name": "power_supply",
+      "display_name": "5V Power Supply",
+      "type": "sht3x",
+      "channel": 0,
+      "address": "0x44",
+      "thresholds": {
+        "warning": 50,
+        "critical": 60,
+        "shutdown": 70
+      },
+      "fan_mapping": ["fan0"],
+      "fan_start_temp": 45,
+      "fan_max_temp": 60
+    },
+    {
+      "name": "rpi_case",
+      "display_name": "Raspberry Pi Case",
+      "type": "bme280",
+      "channel": 1,
+      "address": "0x76",
+      "thresholds": {
+        "warning": 60,
+        "critical": 70,
+        "shutdown": 80
+      },
+      "fan_mapping": ["fan1"],
+      "fan_start_temp": 25,
+      "fan_max_temp": 70
+    },
+    {
+      "name": "stepper_drivers",
+      "display_name": "Stepper Drivers (Octopus)",
+      "type": "bme280",
+      "channel": 4,
+      "address": "0x76",
+      "thresholds": {
+        "warning": 50,
+        "critical": 60,
+        "shutdown": 70
+      },
+      "fan_mapping": ["fan0"],
+      "fan_start_temp": 45,
+      "fan_max_temp": 60
+    }
+  ],
+  "fans": [
+    {
+      "name": "fan0",
+      "display_name": "Octopus Board Fan",
+      "klipper_name": "fan0",
+      "min_speed": 0.3,
+      "max_speed": 1.0
+    },
+    {
+      "name": "fan1",
+      "display_name": "RPi Case Fan",
+      "klipper_name": "fan1",
+      "min_speed": 0.3,
+      "max_speed": 1.0
+    }
+  ],
+  "settings": {
+    "i2c_bus": 1,
+    "mux_address": "0x70",
+    "poll_interval": 5,
+    "moonraker_url": "http://localhost:7125",
+    "log_file": "/var/log/optimus_service/temperature.log",
+    "log_level": "INFO"
+  }
+}
