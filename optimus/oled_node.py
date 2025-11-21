@@ -112,7 +112,7 @@ class OledDisplayNode(Node):
                 if self.printer_status:
                     stats = self.printer_status.get('print_stats', {})
                     state = stats.get('state', 'Unknown')
-                    draw.text((0, y), f"Printer: {state}", fill="white")
+                    draw.text((0, y), f"Status: {state}", fill="white")
                     
                     # Bed/Extruder
                     bed = self.printer_status.get('heater_bed', {})
