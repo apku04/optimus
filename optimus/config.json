@@ -31,6 +31,19 @@
       "fan_max_temp": 70
     },
     {
+      "name": "rpi_cpu",
+      "display_name": "Raspberry Pi CPU",
+      "type": "cpu",
+      "thresholds": {
+        "warning": 65,
+        "critical": 75,
+        "shutdown": 85
+      },
+      "fan_mapping": ["fan1"],
+      "fan_start_temp": 50,
+      "fan_max_temp": 75
+    },
+    {
       "name": "stepper_drivers",
       "display_name": "Stepper Drivers (Octopus)",
       "type": "bme280",

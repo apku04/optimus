@@ -165,9 +165,27 @@ class SensorReader:
             logger.error(f"Failed to read BME280 at 0x{address:02X}, channel {channel}: {e}")
             return {'success': False, 'error': str(e)}
     
+    def read_cpu_temp(self):
+        """Read Raspberry Pi CPU temperature from thermal zone"""
+        try:
+            with open('/sys/class/thermal/thermal_zone0/temp', 'r') as f:
+                temp_millidegrees = int(f.read().strip())
+                temp_c = temp_millidegrees / 1000.0
+                return {
+                    'temperature': round(temp_c, 2),
+                    'success': True
+                }
+        except Exception as e:
+            logger.error(f"Failed to read CPU temperature: {e}")
+            return {'success': False, 'error': str(e)}
+    
     def read_sensor(self, sensor_config):
         """Read sensor based on configuration"""
         sensor_type = sensor_config['type']
+        
+        if sensor_type == 'cpu':
+            return self.read_cpu_temp()
+        
         address = int(sensor_config['address'], 16)
         channel = sensor_config['channel']
         

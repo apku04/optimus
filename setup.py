@@ -31,6 +31,7 @@ setup(
             'oled_node = optimus.oled_node:main',
             'hardware_node = optimus.hardware_node:main',
             'voice_node = optimus.voice_node:main',
+            'motor_calibration = optimus.motor_calibration_server:main',
         ],
     },
 )

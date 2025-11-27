@@ -56,17 +56,21 @@ class OptimusHardwareNode(Node):
         # --- Publishers (Sensors & Fans) ---
         self.publishers_ = {}
         self.fan_publishers_ = {}
+        self.fan_temp_sources = {}  # Track which sensors control which fans
         
         for sensor in self.config['sensors']:
             topic_name = f"sensors/{sensor['name']}/temperature"
             self.publishers_[sensor['name']] = self.create_publisher(Temperature, topic_name, 10)
             
-            # Create fan publishers if mapping exists
+            # Create fan publishers and track temperature sources
             if 'fan_mapping' in sensor:
                 for fan_name in sensor['fan_mapping']:
                     if fan_name not in self.fan_publishers_:
                         fan_topic = f"fans/{fan_name}/set_speed"
                         self.fan_publishers_[fan_name] = self.create_publisher(Float32, fan_topic, 10)
+                        self.fan_temp_sources[fan_name] = []
+                    # Track which sensors control this fan
+                    self.fan_temp_sources[fan_name].append(sensor['name'])
 
         # --- Subscribers (OLED Data) ---
         self.robot_status = {}
@@ -210,7 +214,9 @@ class OptimusHardwareNode(Node):
         try:
             for sensor_config in self.config['sensors']:
                 # This handles Mux switching internally in SensorReader
+                self.get_logger().info(f"Reading sensor: {sensor_config['name']}")
                 reading = self.sensor_reader.read_sensor(sensor_config)
+                self.get_logger().info(f"Result for {sensor_config['name']}: {reading}")
                 
                 if reading and reading.get('success'):
                     msg = Temperature()
@@ -224,38 +230,79 @@ class OptimusHardwareNode(Node):
                     # Update local cache for OLED
                     # Map sensor name to display name or short code
                     short_name = sensor_config['name']
-                    if 'rpi' in short_name: short_name = 'RPi'
-                    elif 'power' in short_name: short_name = 'PSU'
-                    elif 'stepper' in short_name: short_name = 'Drv'
+                    if 'rpi_case' in short_name: 
+                        short_name = 'Case'
+                    elif 'rpi_cpu' in short_name: 
+                        short_name = 'CPU'
+                    elif 'power' in short_name: 
+                        short_name = 'PSU'
+                    elif 'stepper' in short_name: 
+                        short_name = 'Drv'
                     
                     self.sensor_data[short_name] = reading['temperature']
-                    
-                    # --- Fan Control Logic ---
-                    if 'fan_mapping' in sensor_config:
-                        temp = float(reading['temperature'])
-                        start_temp = sensor_config.get('fan_start_temp', 40)
-                        max_temp = sensor_config.get('fan_max_temp', 60)
-                        
-                        speed = 0.0
-                        if temp >= max_temp:
-                            speed = 1.0
-                        elif temp >= start_temp:
-                            # Linear interpolation
-                            speed = (temp - start_temp) / (max_temp - start_temp)
-                            # Ensure minimum speed to start fan if needed (e.g. 0.2)
-                            speed = max(0.2, speed)
-                        
-                        # Publish speed to mapped fans
-                        for fan_name in sensor_config['fan_mapping']:
-                            if fan_name in self.fan_publishers_:
-                                msg = Float32()
-                                msg.data = float(speed)
-                                self.fan_publishers_[fan_name].publish(msg)
-                                self.get_logger().debug(f"Fan {fan_name} set to {speed:.2f} (T={temp}C)")
 
                     self.get_logger().debug(f"Published {sensor_config['name']}: {reading['temperature']}C")
                 else:
                     self.get_logger().warn(f"Failed to read {sensor_config['name']}")
+            
+            # --- Fan Control Logic (after all sensors read) ---
+            # For fans controlled by multiple sensors, use the MAX temperature
+            for fan_name, fan_pub in self.fan_publishers_.items():
+                if fan_name not in self.fan_temp_sources:
+                    continue
+                
+                # Get fan config for min/max speed
+                fan_cfg = next((f for f in self.config.get('fans', []) if f['name'] == fan_name), {})
+                min_fan_speed = fan_cfg.get('min_speed', 0.2)
+                max_fan_speed = fan_cfg.get('max_speed', 1.0)
+                    
+                max_speed = 0.0
+                control_temp = 0.0
+                
+                for sensor_name in self.fan_temp_sources[fan_name]:
+                    # Find the sensor config
+                    sensor_cfg = next((s for s in self.config['sensors'] if s['name'] == sensor_name), None)
+                    if not sensor_cfg:
+                        continue
+                    
+                    # Get the temperature from local cache
+                    short_name = sensor_name
+                    if 'rpi_case' in short_name: 
+                        short_name = 'Case'
+                    elif 'rpi_cpu' in short_name: 
+                        short_name = 'CPU'
+                    elif 'power' in short_name: 
+                        short_name = 'PSU'
+                    elif 'stepper' in short_name: 
+                        short_name = 'Drv'
+                    
+                    if short_name not in self.sensor_data:
+                        continue
+                    
+                    temp = self.sensor_data[short_name]
+                    start_temp = sensor_cfg.get('fan_start_temp', 40)
+                    max_temp = sensor_cfg.get('fan_max_temp', 60)
+                    
+                    speed = 0.0
+                    if temp >= max_temp:
+                        speed = max_fan_speed
+                    elif temp >= start_temp:
+                        # Linear interpolation between min and max speed
+                        ratio = (temp - start_temp) / (max_temp - start_temp)
+                        speed = min_fan_speed + ratio * (max_fan_speed - min_fan_speed)
+                    
+                    if speed > max_speed:
+                        max_speed = speed
+                        control_temp = temp
+                
+                # Publish the maximum required speed
+                if max_speed > 0 or True:  # Always publish, even if 0
+                    msg = Float32()
+                    msg.data = float(max_speed)
+                    fan_pub.publish(msg)
+                    if max_speed > 0:
+                        self.get_logger().debug(f"Fan {fan_name} set to {max_speed:.2f} (T={control_temp:.1f}C)")
+                    
         finally:
             # Always disable mux after reading sensors to free bus for OLED (if it was shared)
             self.sensor_reader.disable_mux_channels()
@@ -335,18 +382,24 @@ class OptimusHardwareNode(Node):
                 
                 # --- TEMPERATURE SECTION (Line 38-90) ---
                 y = 38
-                for name, temp in self.sensor_data.items():
+                # Display in specific order: CPU, Case, PSU, Drv
+                display_order = ['CPU', 'Case', 'PSU', 'Drv']
+                for name in display_order:
+                    if name not in self.sensor_data:
+                        continue
+                    temp = self.sensor_data[name]
+                    
                     # Determine warning level
                     warn_level = ""
-                    if temp > 65:
+                    if temp > 70:
                         warn_level = "!" if self.blink_state else "X"
-                    elif temp > 55:
+                    elif temp > 60:
                         warn_level = "!"
-                    elif temp > 45:
+                    elif temp > 50:
                         warn_level = "~"
                     
                     # Format with aligned columns
-                    name_padded = f"{name:3s}"
+                    name_padded = f"{name:4s}"
                     temp_str = f"{temp:5.1f}"
                     draw.text((2, y), f"{warn_level:1s}{name_padded} {temp_str}C", fill="white")
                     y += 11
