@@ -1,0 +1,92 @@
+{
+  "network": {
+    "jetson_ip": "192.168.1.133",
+    "rpi_ip": "192.168.1.136",
+    "udp_port": 5555
+  },
+  "motors": {
+    "moonraker_url": "http://localhost:7125",
+    "pan": {
+      "stepper": "stepper_0",
+      "center": -0.5,
+      "min": -22.0,
+      "max": 22.0,
+      "speed": 40,
+      "accel": 20
+    },
+    "tilt": {
+      "stepper": "stepper_1",
+      "center": 0.5,
+      "min": -2.5,
+      "max": 5.0,
+      "speed": 30,
+      "accel": 10
+    }
+  },
+  "tracking": {
+    "smoothing": 0.30,
+    "deadzone": 0.20,
+    "return_to_center_delay": 3.0,
+    "invert_pan": false,
+    "invert_tilt": false
+  },
+  "camera": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "process_width": 640,
+    "process_height": 480
+  },
+  "tracking_decoupled": {
+    "dx_dpan": 0.17165,
+    "dy_dpan": 0.002462,
+    "dx_dtilt": -0.015925,
+    "dy_dtilt": 0.036074999999999996,
+    "alpha": 0.95,
+    "ema": 0.75,
+    "move_cooldown_s": 0.0002,
+    "deadzone_hysteresis": 0.03,
+    "require_outside_samples": 3,
+    "max_step_pan_deg": 0.1,
+    "max_step_tilt_deg": 0.1,
+    "loop_hz": 30,
+    "combine_moves": true,
+    "speed_scaling": false,
+    "cmd_smoothing": 0.68,
+    "hold_measurements_during_motion": true,
+    "post_move_settle_s": 0.2,
+    "step_deg": 1.0,
+    "settle_s": 0.001,
+    "sample_s": 0.001,
+    "timestamp": 1765724964.1378899,
+    "notes": "Decoupled control calibration. Matrix A maps motor degrees to image offsets: [x;y] \u2248 A*[pan;tilt]. Used as delta = -inv(A)*[x;y].",
+    "min_step_pan_deg": 0.04,
+    "min_step_tilt_deg": 0.03,
+    "pan_speed": 80.0,
+    "tilt_speed": 65.0,
+    "max_pan_speed": 1000.0,
+    "max_tilt_speed": 1000.0,
+    "sweep_enabled": true,
+    "sweep_error": 0.24,
+    "sweep_max_step_pan_deg": 6.6,
+    "sweep_max_step_tilt_deg": 1.8,
+    "sweep_pan_speed": 500.0,
+    "sweep_tilt_speed": 500.0,
+    "sweep_hold_s": 0.04,
+    "cmd_smoothing_near": 0.72,
+    "cmd_smoothing_far": 0.15,
+    "control_mode": "position",
+    "use_velocity_prediction": false,
+    "lookahead_s": 0.0,
+    "alpha_near_mult": 0.6,
+    "alpha_far_mult": 1.0,
+    "reverse_deadband_pan_deg": 0.08,
+    "reverse_deadband_tilt_deg": 0.05,
+    "rate_kp": 1.8,
+    "rate_kd": 0.0,
+    "rate_use_velocity_feedback": false,
+    "rate_motor_ema": 0.8,
+    "rate_speed_dt_min_s": 0.07,
+    "active_preset": "gimbal"
+  }
+}

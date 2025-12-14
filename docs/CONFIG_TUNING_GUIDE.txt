@@ -1,0 +1,159 @@
+CONFIG TUNING GUIDE (Optimus Head Tracker)
+Date: 2025-12-14
+
+Important
+- Do NOT add comments inside config.json. JSON comments will break loading.
+- This guide tells you what each knob does and how to tune it.
+- Runtime reads: config.json
+
+============================================================
+A) Safety / sanity checks
+------------------------------------------------------------
+1) If changing SPEED has no effect:
+- Klipper manual_stepper velocity/accel caps may be the limiter.
+- Code also clamps by tracking_decoupled.max_pan_speed / max_tilt_speed.
+
+2) If it oscillates at rest:
+- Usually backlash + measurement jitter.
+- Increase deadzone and/or min_step_* and/or reversal deadband.
+- Ensure velocity prediction is OFF (use_velocity_prediction=false).
+
+3) If it feels “step-step-step”:
+- Increase max_step_* (bigger chunks, fewer commands)
+- Increase pan_speed/tilt_speed (if Klipper caps allow)
+- Reduce post_move_settle_s (less waiting) OR reduce move_cooldown_s.
+
+============================================================
+B) Key sections
+------------------------------------------------------------
+[network]
+- jetson_ip / rpi_ip / udp_port
+  Only networking; not tuning.
+
+[motors]
+- motors.pan.speed / motors.tilt.speed
+  Default speeds used for simple moves (center/calibrate). Not the main tracking speeds.
+- motors.pan.accel / motors.tilt.accel
+  Used as ACCEL= in MANUAL_STEPPER (and also for internal move-time estimates).
+  Higher accel = snappier but can shake and worsen overshoot.
+
+[tracking]
+- tracking.smoothing
+  Legacy smoothing (used by older trackers). For decoupled tracker, this is mostly informational.
+- tracking.deadzone
+  Main “do nothing” zone in normalized image units.
+  Increase => less jitter, more steady; but less precise centering.
+  Decrease => more precise, but more micro-moves.
+
+[tracking_decoupled]  (main tuning section)
+------------------------------------------------------------
+Core control
+- dx_dpan, dy_dpan, dx_dtilt, dy_dtilt
+  Calibration matrix A mapping motor degrees -> image offset.
+  If convergence is wrong / drift, re-run --calibrate.
+
+- control_mode
+  "position" (recommended): uses position error and the calibrated inverse.
+  "rate" (experimental): more sensitive to delay/jitter.
+
+- alpha
+  Main aggressiveness (gain) in position mode.
+  Increase => faster centering but more overshoot/oscillation.
+  Decrease => slower but steadier.
+
+- alpha_near_mult / alpha_far_mult
+  Scales alpha based on how far from center you are.
+  Lower alpha_near_mult reduces bounce near center.
+
+Smoothing / anti-jitter
+- ema
+  Measurement EMA (0..0.98). Higher = smoother measurement, less sign-flip jitter, more lag.
+
+- cmd_smoothing
+  Smooths commanded target positions (not the measurement). Higher = more glide, less step feel.
+
+- deadzone_hysteresis
+  Adds a gap between “start moving” and “stop moving”. Higher = less toggling.
+
+- require_outside_samples
+  How many consecutive samples must be outside deadzone before moving.
+  Increase => less jitter, more delay.
+
+Motion pacing (VERY important)
+- move_cooldown_s
+  Minimum time between commands. If too small, can queue commands and oscillate.
+
+- hold_measurements_during_motion
+  If true, ignores Jetson updates while move is underway (prevents chasing the box).
+
+- post_move_settle_s
+  Extra wait after motion for the image to settle.
+  Increase => more stable, less oscillation, but more “pause-y”.
+  Decrease => more responsive, but can reintroduce chasing.
+
+Step sizing
+- max_step_pan_deg / max_step_tilt_deg
+  Max correction per update. Bigger => fewer steps, can look smoother, but can overshoot.
+
+- min_step_pan_deg / min_step_tilt_deg
+  Ignore tiny corrections. Bigger => less jitter, but can leave small steady error.
+
+Speed
+- pan_speed / tilt_speed
+  Base SPEED for moves (deg/s). If it’s capped, increase Klipper manual_stepper velocity.
+
+- max_pan_speed / max_tilt_speed
+  Hard clamp inside the controller. Raise only if Klipper supports it.
+
+Sweep (gimbal-like when far)
+- sweep_enabled
+  Enables dynamic boost when far from center.
+
+- sweep_error
+  Error threshold where boost begins.
+
+- sweep_max_step_pan_deg / sweep_max_step_tilt_deg
+  Step-size cap during boost.
+
+- sweep_pan_speed / sweep_tilt_speed
+  Speed used during boost.
+
+Backlash / direction flipping
+- reverse_deadband_pan_deg / reverse_deadband_tilt_deg
+  If the requested move reverses direction and is smaller than this, skip it.
+  Increase to eliminate constant left-right jitter around center.
+
+Velocity prediction (usually OFF)
+- use_velocity_prediction
+  If true, uses pkt.x_velocity/y_velocity for lookahead.
+  Can create “cat chasing mouse” on a moving camera.
+
+- lookahead_s
+  How far to predict ahead if enabled.
+
+============================================================
+C) Recommended tuning workflow
+------------------------------------------------------------
+1) Get stable first
+- Increase deadzone until jitter stops.
+- Increase min_step_* and reverse_deadband_* until sign-flip stops.
+
+2) Get smooth motion
+- Raise cmd_smoothing.
+- Raise max_step_* a bit so it takes fewer, larger moves.
+- Use sweep_enabled to get gimbal-like large motions far away.
+
+3) Get faster
+- Raise pan_speed/tilt_speed and sweep speeds.
+- If no effect: increase Klipper manual_stepper velocity/accel caps.
+
+============================================================
+D) One-command presets
+------------------------------------------------------------
+- python3 rpi/tune_presets.py fastsmooth
+- python3 rpi/tune_presets.py gimbal
+- python3 rpi/tune_presets.py sweep
+
+Use:
+- python3 rpi/tune_presets.py --show
+to confirm tracking_decoupled.active_preset

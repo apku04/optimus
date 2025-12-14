@@ -1,0 +1,139 @@
+// Annotated copy of config.json (JSONC allows comments).
+// IMPORTANT: The tracker reads config.json (strict JSON). Do not run from this file unless
+// you update the loader to parse JSONC.
+//
+// How to use:
+// - Keep editing config.json for the actual values.
+// - Use this file as a reference for what each parameter does.
+//
+// Generated: 2025-12-14
+{
+  // Networking settings for Jetson -> RPi UDP stream
+  "network": {
+    "jetson_ip": "192.168.1.133", // Jetson sender IP (informational)
+    "rpi_ip": "192.168.1.136",   // RPi receiver IP (informational)
+    "udp_port": 5555             // UDP port used by both sides
+  },
+
+  // Motor + Moonraker/Klipper configuration
+  "motors": {
+    "moonraker_url": "http://localhost:7125", // Moonraker API base URL
+
+    "pan": {
+      "stepper": "stepper_0", // Klipper MANUAL_STEPPER name
+      "center": -0.5,          // Degrees to treat as "center"
+      "min": -22.0,            // Hard min clamp (degrees)
+      "max": 22.0,             // Hard max clamp (degrees)
+      "speed": 40,             // Default MOVE speed for generic motor moves (deg/s)
+      "accel": 20              // Optional ACCEL= for MANUAL_STEPPER (deg/s^2-ish)
+    },
+
+    "tilt": {
+      "stepper": "stepper_1",
+      "center": 0.5,
+      "min": -2.5,
+      "max": 5.0,
+      "speed": 30,
+      "accel": 10
+    }
+  },
+
+  // High-level tracking knobs (some are legacy)
+  "tracking": {
+    "smoothing": 0.25,               // Legacy smoothing (not primary in decoupled controller)
+    "deadzone": 0.20,                // Bigger => less jitter, less precision
+    "return_to_center_delay": 3.0,   // Seconds without face before returning to center
+    "invert_pan": false,             // Flip pan direction
+    "invert_tilt": false             // Flip tilt direction
+  },
+
+  // Camera metadata (mostly informational for this controller)
+  "camera": {
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "process_width": 640,
+    "process_height": 480
+  },
+
+  // Main decoupled controller tuning section
+  "tracking_decoupled": {
+    // Calibration matrix A: [x;y] ≈ [[dx_dpan, dx_dtilt],[dy_dpan, dy_dtilt]] * [pan;tilt]
+    "dx_dpan": 0.17165,                 // How x changes per +1° pan
+    "dy_dpan": 0.002462,                // Cross-coupling: how y changes per +1° pan
+    "dx_dtilt": -0.015925,              // Cross-coupling: how x changes per +1° tilt
+    "dy_dtilt": 0.036074999999999996,   // How y changes per +1° tilt
+
+    "alpha": 0.95,                      // Main gain (position mode). Higher => faster, can overshoot.
+    "alpha_near_mult": 0.6,             // Reduce gain near center to prevent bouncing
+    "alpha_far_mult": 1.0,              // Gain scale when far
+
+    "ema": 0.75,                        // Measurement EMA (0..0.98). Higher => smoother, more lag.
+
+    // Command pacing
+    "move_cooldown_s": 0.035,           // Minimum seconds between commands
+    "hold_measurements_during_motion": true, // Ignore Jetson updates while moving
+    "post_move_settle_s": 0.15,         // Extra settle time after a move
+
+    // Anti-dither gating
+    "deadzone_hysteresis": 0.03,        // Reduces toggling around deadzone
+    "require_outside_samples": 3,       // Require N consecutive samples outside before moving
+
+    // Step sizing
+    "max_step_pan_deg": 0.8,            // Max per-update correction (pan)
+    "max_step_tilt_deg": 0.32,          // Max per-update correction (tilt)
+    "min_step_pan_deg": 0.04,           // Ignore smaller corrections (pan)
+    "min_step_tilt_deg": 0.03,          // Ignore smaller corrections (tilt)
+
+    // Backlash suppression
+    "reverse_deadband_pan_deg": 0.08,   // Skip tiny direction flips (pan)
+    "reverse_deadband_tilt_deg": 0.05,  // Skip tiny direction flips (tilt)
+
+    // Loop
+    "loop_hz": 30,                      // Control loop frequency
+    "combine_moves": true,              // Send pan+tilt in one Moonraker call
+
+    // Command smoothing
+    "cmd_smoothing": 0.68,              // Smooths setpoints (0..0.98). Higher => more glide.
+    "cmd_smoothing_near": 0.72,         // Optional: more smoothing near center
+    "cmd_smoothing_far": 0.45,          // Optional: less smoothing when far
+
+    // Speeds
+    "speed_scaling": false,             // If true, vary speed with error/step size
+    "pan_speed": 80.0,                  // Base SPEED for pan moves
+    "tilt_speed": 55.0,                 // Base SPEED for tilt moves
+    "max_pan_speed": 90.0,              // Clamp for pan SPEED
+    "max_tilt_speed": 65.0,             // Clamp for tilt SPEED
+
+    // Sweep boost (non-blocking)
+    "sweep_enabled": true,              // Enable boost when far from center
+    "sweep_error": 0.24,                // Error threshold to start boosting
+    "sweep_max_step_pan_deg": 1.6,      // Max step during boost
+    "sweep_max_step_tilt_deg": 0.6,
+    "sweep_pan_speed": 80.0,            // Speed during boost
+    "sweep_tilt_speed": 55.0,
+    "sweep_hold_s": 0.08,               // Legacy/optional hold parameter
+
+    // Velocity prediction (normally OFF)
+    "use_velocity_prediction": false,   // If true, predict x/y forward using velocities
+    "lookahead_s": 0.0,                 // Prediction horizon
+
+    // Experimental rate controller (generally leave unused)
+    "control_mode": "position",        // "position" recommended; "rate" experimental
+    "rate_kp": 1.8,
+    "rate_kd": 0.0,
+    "rate_use_velocity_feedback": false,
+    "rate_motor_ema": 0.8,
+    "rate_speed_dt_min_s": 0.07,
+
+    // Calibration bookkeeping
+    "step_deg": 2.0,
+    "settle_s": 0.6,
+    "sample_s": 0.6,
+    "timestamp": 1765724964.1378899,
+    "notes": "Decoupled control calibration. Matrix A maps motor degrees to image offsets: [x;y] ≈ A*[pan;tilt]. Used as delta = -inv(A)*[x;y].",
+
+    // Convenience: last applied preset name
+    "active_preset": "gimbal"
+  }
+}

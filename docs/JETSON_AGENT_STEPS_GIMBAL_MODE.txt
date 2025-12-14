@@ -1,0 +1,107 @@
+JETSON↔RPI “GIMBAL/RATE MODE” HANDOFF GUIDE (for your other GPT-5.2 agent)
+Date: 2025-12-14
+Repo: /home/acp/optimus
+Goal: More gimbal-like continuous motion by using Jetson’s velocity estimate and a rate-based controller on the RPi.
+
+======================================================================
+1) What you’re deploying (high level)
+----------------------------------------------------------------------
+A) Jetson
+- File: jetson/face_tracker_v4.py
+- Change: UDP packet now includes canonical fields:
+  detected, x, y, confidence, stability, box_size, x_velocity, y_velocity, timestamp
+- Still sends legacy fields for backward compatibility:
+  face_detected, offset_x/offset_y, x_offset/y_offset
+
+B) Raspberry Pi
+- File: rpi/head_tracker_decoupled.py
+- Change: adds OPTIONAL control mode “rate”:
+  tracking_decoupled.control_mode = "rate"
+  Uses x_velocity/y_velocity + a PD-like law in image space, maps to motor rates via inv(A), integrates over dt.
+- Default behavior remains unchanged ("position").
+
+======================================================================
+2) Jetson-side steps (do these in the Jetson VS Code session)
+----------------------------------------------------------------------
+Step J1 — Update the Jetson script
+- Ensure jetson/face_tracker_v4.py matches the workspace version.
+- Key requirement: UDP payload must contain x_velocity/y_velocity and timestamp.
+
+Step J2 — Run the Jetson tracker
+- From Jetson:
+  cd ~/optimus/jetson
+  python3 face_tracker_v4.py --rpi-ip <RPI_IP> --udp-port 5555
+
+Step J3 — Sanity check the UDP output
+- Optional (if you can quickly add a print): print the JSON you send at ~1Hz.
+- Confirm fields exist:
+  x, y, detected, confidence, stability, box_size, x_velocity, y_velocity, timestamp
+
+Step J4 — If it fails to detect
+- Confirm camera pipeline works (CSI vs USB).
+- Confirm OpenCV DNN model download succeeded, otherwise Haar fallback is used.
+
+======================================================================
+3) RPi-side steps (do these on the RPi)
+----------------------------------------------------------------------
+Step R1 — Confirm you’re on the updated code
+- rpi/head_tracker_decoupled.py contains control_mode handling.
+
+Step R2 — Keep current stable mode first
+- Start with position mode (baseline):
+  tracking_decoupled.control_mode = "position"
+- Run:
+  cd /home/acp/optimus
+  python3 rpi/head_tracker_decoupled.py
+- Confirm tracking is still “perfect” as before.
+
+Step R3 — Enable rate/gimbal mode
+- Edit config.json:
+  tracking_decoupled.control_mode = "rate"
+  tracking_decoupled.rate_kp = 2.5
+  tracking_decoupled.rate_kd = 0.35
+
+- Run again:
+  python3 rpi/head_tracker_decoupled.py
+
+Step R4 — Tuning rules (quick)
+- If motion is too sluggish:
+  increase rate_kp (try 3.5 then 5.0)
+- If it overshoots or “wobbles”:
+  increase rate_kd slightly (try 0.45 then 0.6)
+  OR reduce rate_kp
+- If it micro-dithers near center:
+  increase deadzone a bit OR increase min_step_pan_deg/min_step_tilt_deg
+
+Step R5 — Safety caps
+- Rate mode uses SPEED derived from (step/dt), clamped by:
+  tracking_decoupled.max_pan_speed / max_tilt_speed
+- Ensure Klipper manual_stepper velocity/accel caps allow these speeds.
+
+======================================================================
+4) Protocol notes (important)
+----------------------------------------------------------------------
+- x/y: normalized offsets in [-1,+1]
+- x_velocity/y_velocity: normalized units per second
+- timestamp: sender time.time(); only dt between packets is used
+
+======================================================================
+5) Rollback plan
+----------------------------------------------------------------------
+Rollback A (RPi):
+- Set tracking_decoupled.control_mode back to "position".
+
+Rollback B (Jetson):
+- You can keep the richer packet; the old receiver ignores unknown keys.
+
+======================================================================
+6) Success criteria
+----------------------------------------------------------------------
+- In position mode: no regressions.
+- In rate mode: motion looks more continuous/gimbal-like while maintaining stable centering.
+- No motor “queueing” (no lagging behind commands).
+
+======================================================================
+7) If you want the agent to extend further (optional follow-on)
+----------------------------------------------------------------------
+Ask the agent to add a debug overlay on Jetson showing x_velocity/y_velocity and stability, and add an on-screen indicator when the filter is predicting (no detection frames).
