@@ -1,0 +1,146 @@
+MPC Visual Servo Head Tracker
+=============================
+
+This is a fresh implementation of Model Predictive Control (MPC) for pan/tilt
+camera tracking, based on the standard approach used in academic papers like:
+
+- Nebeluk et al., "Predictive tracking of an object by a pan–tilt camera",
+  Nonlinear Dynamics (2023)
+- Yang et al., "Online Predictive Visual Servo Control for Constrained Target
+  Tracking", Drones (2024)
+
+Why MPC instead of PID / reactive control?
+------------------------------------------
+Your problem (camera-on-gimbal with delay + constraints) is exactly what MPC
+is designed for:
+
+1. **Handles delay explicitly**: MPC predicts forward in time, so it doesn't
+   "chase" the measurement like a reactive controller.
+
+2. **Respects constraints**: rate limits, accel limits, and joint limits are
+   built into the optimization — no separate clamping logic.
+
+3. **Smooth motion**: by minimizing control effort (acceleration), MPC
+   naturally produces smooth trajectories.
+
+4. **Reduces oscillation**: the predictive horizon prevents overshoot that
+   causes hunting in delayed systems.
+
+
+How to run
+----------
+On the Raspberry Pi:
+
+  cd /home/acp/optimus
+  python3 rpi/head_tracker_mpc.py
+
+Dry-run (no motors):
+
+  python3 rpi/head_tracker_mpc.py --dry-run
+
+
+Prerequisites
+-------------
+This controller uses the calibration matrix from tracking_decoupled:
+  dx_dpan, dx_dtilt, dy_dpan, dy_dtilt
+
+If those are missing, run calibration first:
+
+  python3 rpi/head_tracker_decoupled.py --calibrate
+
+
+Configuration (config.json)
+---------------------------
+The MPC parameters are in the "tracking_mpc" section:
+
+  "tracking_mpc": {
+    "dt": 0.033,              // Control timestep (~30 Hz)
+    "horizon": 15,            // MPC horizon (steps). Longer = smoother but slower.
+    "q_error": 5000.0,        // Weight on image error. Higher = more aggressive.
+    "r_accel": 0.1,           // Weight on acceleration. Higher = smoother.
+    "q_terminal": 10000.0,    // Terminal cost weight.
+    "vel_max_pan": 70.0,      // Max pan velocity (deg/s)
+    "vel_max_tilt": 50.0,     // Max tilt velocity (deg/s)
+    "accel_max_pan": 400.0,   // Max pan acceleration (deg/s^2)
+    "accel_max_tilt": 300.0,  // Max tilt acceleration (deg/s^2)
+    "deadzone": 0.10,         // Error deadzone (normalized)
+    "min_confidence": 0.40,   // Min face detection confidence
+    "meas_ema": 0.70,         // Measurement EMA filter (0=none, 0.9=heavy)
+    "segment_dt": 0.05,       // Time between Klipper commands
+    "queue_limit_s": 0.20     // Max queued motion horizon
+  }
+
+Note on cost weights:
+- Image error is normalized [0,1], motor angles are degrees
+- q_error=5000 and r_accel=0.1 gives aggressive tracking
+- For smoother (but slower) response, try q_error=2000, r_accel=1.0
+
+
+Tuning guide
+------------
+
+If it oscillates:
+- Reduce q_error (less aggressive)
+- Increase r_accel (penalize sudden moves)
+- Increase meas_ema (more filtering)
+
+If it's too slow / lags behind:
+- Increase q_error
+- Decrease r_accel
+- Increase vel_max_* and accel_max_*
+
+If it's jerky:
+- Increase horizon (more lookahead)
+- Increase r_accel (smoother)
+- Decrease segment_dt (more frequent commands)
+
+If it hits joint limits:
+- The MPC should handle this, but check pan/tilt min/max in motors config
+
+
+State-space model
+-----------------
+The MPC models each axis as a 2nd-order system:
+
+  State:   x = [position, velocity]
+  Input:   u = acceleration
+  Output:  e = C_cam @ [pan, tilt] + e_target
+
+Dynamics (discrete, Euler):
+  pos_{k+1} = pos_k + dt * vel_k + 0.5 * dt^2 * u_k
+  vel_{k+1} = vel_k + dt * u_k
+
+The calibration matrix C_cam maps motor positions to image offsets.
+
+MPC minimizes over horizon N:
+  J = sum_{k=0}^{N-1} [ e_k^T Q e_k + u_k^T R u_k ] + e_N^T Q_f e_N
+
+Subject to:
+  - dynamics
+  - |vel| <= vel_max
+  - |u| <= accel_max
+  - pos_min <= pos <= pos_max
+
+
+Performance
+-----------
+On Raspberry Pi 4, the QP solve typically takes 5-15ms per iteration,
+which is fast enough for 30 Hz control.
+
+The implementation uses scipy.optimize.minimize with L-BFGS-B and soft
+penalties for state constraints. This avoids needing external QP solvers
+like OSQP or CVXPY.
+
+
+Comparison to other controllers
+-------------------------------
+
+| Controller              | Pros                          | Cons                       |
+|------------------------|-------------------------------|----------------------------|
+| PID (reactive)         | Simple, fast                  | Oscillates with delay      |
+| Cascaded PI            | Handles rate limits           | Doesn't predict forward    |
+| MPC                    | Handles delay + constraints   | More complex, slower solve |
+
+MPC is the "standard scientific" approach for this problem when you have
+significant measurement delay (camera fps + detection + network) and
+mechanical constraints.

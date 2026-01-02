@@ -24,6 +24,24 @@ The goal is: keep the face centered **without oscillation**, by combining:
 
 ---
 
+## Quick start (recommended for smooth “gimbal-like” motion)
+
+With your setup (Klipper on the RPi + Jetson on Ethernet), it’s usually best to keep the **motor control loop on the RPi** (closest to Klipper + the Octopus USB link) to minimize latency/jitter. Jetson should focus on vision and send offsets.
+
+### Jetson: run face tracking (sends UDP x/y offsets)
+
+- `python3 jetson/face_tracker_v4.py --rpi-ip 192.168.1.136 --udp-port 5555`
+
+### RPi: run a motor controller
+
+For the smoothest motion, use the velocity controller (planner-based):
+
+- `python3 rpi/head_tracker_velocity.py --config config.json`
+
+Alternative (very stable, but can feel more “step-step”):
+
+- `python3 rpi/head_tracker_decoupled.py --config config.json`
+
 ## Editing rules
 
 - **Don’t add comments to `config.json`** (it will break parsing).
@@ -149,6 +167,11 @@ If the system moves the *wrong way* or cross-coupling is weird, recalibrate (don
   - Target control-loop frequency.
   - Higher → more responsive, more commands.
   - Lower → more stable/less load, but more “steppy”.
+
+Note: the controller has two pacing behaviors.
+- Conservative pacing (default): sends one move then waits for estimated motion to finish (looks like step → pause).
+- Streaming pacing (gimbal-like): sends many short segments and allows a small amount of queued motion.
+  By default, streaming pacing auto-enables when `loop_hz >= 100`.
 
 - `tracking_decoupled.move_cooldown_s` (seconds)
   - Minimum time between sending commands.

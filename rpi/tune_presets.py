@@ -197,6 +197,13 @@ PRESETS: Dict[str, Dict[str, Any]] = {
             "lookahead_s": 0.0,
             "control_mode": "position",
 
+            # Streaming pacing (continuous feel): queue short segments and use
+            # motion feedforward so we can correct while the camera is moving.
+            "loop_hz": 80,
+            "queue_limit_s": 0.25,
+            "segment_dt_s": 0.05,
+            "motion_feedforward": True,
+
             # Non-blocking dynamic sweep scaling when far.
             "sweep_enabled": True,
             "sweep_error": 0.24,

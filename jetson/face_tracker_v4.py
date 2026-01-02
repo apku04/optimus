@@ -19,6 +19,7 @@ import time
 import sys
 import threading
 import os
+import requests
 from flask import Flask, Response
 
 app = Flask(__name__)
@@ -288,6 +289,14 @@ class JetsonFaceTracker:
         self.smooth_x = 0
         self.smooth_y = 0
         self.output_alpha = 0.5  # Output smoothing
+        
+        # Delay monitoring
+        self.delay_stats = {
+            "latest_delay_ms": 0.0,
+            "avg_delay_ms": 0.0,
+            "packet_count": 0
+        }
+        self.last_delay_fetch = 0
     
     def _create_gstreamer_pipeline(self, sensor_id=0):
         """Create GStreamer pipeline for CSI camera with GPU processing"""
@@ -324,6 +333,20 @@ class JetsonFaceTracker:
                 return True
         
         return False
+    
+    def _fetch_delay_stats(self):
+        """Fetch delay statistics from RPi monitor (throttled to avoid spam)"""
+        now = time.time()
+        if now - self.last_delay_fetch < 0.5:  # Only fetch every 500ms
+            return
+        
+        self.last_delay_fetch = now
+        try:
+            response = requests.get(f"http://{self.rpi_ip}:8080/delay", timeout=0.1)
+            if response.status_code == 200:
+                self.delay_stats = response.json()
+        except:
+            pass  # Silently fail if delay monitor not running
     
     def _send_position(
         self,
@@ -449,9 +472,17 @@ class JetsonFaceTracker:
                     x, y, fw, fh = self.last_face_box[:4]
                 cv2.rectangle(frame, (x, y), (x + fw, y + fh), (0, 255, 0), 2)
             
-            # Draw Kalman predicted center
+            # Draw Kalman predicted center (this is what we send over UDP)
             cv2.circle(frame, (int(kx), int(ky)), 8, (0, 255, 255), -1)
             cv2.line(frame, (cx, cy), (int(kx), int(ky)), (255, 0, 0), 2)
+            
+            # Draw crosshair at the face center being sent to RPi
+            cv2.line(frame, (int(kx) - 20, int(ky)), (int(kx) + 20, int(ky)), (0, 255, 255), 3)
+            cv2.line(frame, (int(kx), int(ky) - 20), (int(kx), int(ky) + 20), (0, 255, 255), 3)
+            
+            # Label the face center
+            cv2.putText(frame, f"FACE CENTER", (int(kx) + 25, int(ky) - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
             
             status = "TRACKING"
             color = (0, 255, 0)
@@ -478,12 +509,25 @@ class JetsonFaceTracker:
         # Draw crosshair at center
         cv2.line(frame, (cx - 30, cy), (cx + 30, cy), (0, 255, 0), 2)
         cv2.line(frame, (cx, cy - 30), (cx, cy + 30), (0, 255, 0), 2)
+        cv2.putText(frame, "IMAGE CENTER", (cx + 35, cy - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
         # Draw status
         cv2.putText(frame, f"{status} | FPS:{self.fps:.0f} | GPU:{self.detector.use_gpu}",
                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(frame, f"Output: X:{self.smooth_x:+.3f} Y:{self.smooth_y:+.3f}",
+        cv2.putText(frame, f"UDP Data -> RPi: X:{self.smooth_x:+.3f} Y:{self.smooth_y:+.3f}",
                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Show face detection details
+        if kx is not None:
+            face_pixel_pos = f"Face Pixels: ({int(kx)}, {int(ky)})"
+            cv2.putText(frame, face_pixel_pos, (10, 120), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        # Fetch and display delay stats
+        self._fetch_delay_stats()
+        delay_text = f"Net Delay: {self.delay_stats['latest_delay_ms']:.1f}ms (avg: {self.delay_stats['avg_delay_ms']:.1f}ms)"
+        cv2.putText(frame, delay_text, (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
         
         with frame_lock:
             latest_frame = frame.copy()
@@ -577,10 +621,10 @@ if __name__ == "__main__":
     
     # Start web server in background
     from threading import Thread
-    web_thread = Thread(target=lambda: app.run(host='0.0.0.0', port=8080, threaded=True, use_reloader=False))
+    web_thread = Thread(target=lambda: app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False))
     web_thread.daemon = True
     web_thread.start()
-    print("Web server at http://0.0.0.0:8080")
+    print("Web server at http://0.0.0.0:5000")
     
     try:
         tracker.start()

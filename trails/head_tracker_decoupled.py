@@ -55,6 +55,10 @@ from typing import Any, Dict, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).parent.parent / "shared"))
 from motor_control import MotorController
 
+# Global delay tracking for display
+latest_delay_ms = 0.0
+delay_history = []
+
 
 @dataclass
 class FacePacket:
@@ -141,10 +145,12 @@ class UdpFaceReceiver:
         )
 
     def get_latest(self) -> Optional[FacePacket]:
+        global latest_delay_ms, delay_history
         latest: Optional[FacePacket] = None
         while True:
             try:
                 data, _ = self.sock.recvfrom(4096)
+                receive_time = time.time()
             except BlockingIOError:
                 break
             except OSError:
@@ -156,6 +162,15 @@ class UdpFaceReceiver:
                 pkt = None
 
             if pkt is not None:
+                # Calculate delay
+                delay_ms = (receive_time - pkt.timestamp) * 1000.0
+                latest_delay_ms = delay_ms
+                
+                # Keep history for averaging
+                delay_history.append(delay_ms)
+                if len(delay_history) > 50:  # Keep last 50 samples
+                    delay_history.pop(0)
+                
                 latest = pkt
 
         return latest
@@ -450,6 +465,32 @@ def run_tracker(config_path: Path, *, dry_run: bool, sync: bool) -> int:
 
     loop_hz = float(dec.get("loop_hz", 20.0))
     loop_dt = 1.0 / max(1.0, loop_hz)
+    # Prevent busy-looping when loop_hz is set very high. Jetson UDP is typically
+    # ~30Hz and Moonraker HTTP latency dominates beyond ~50-100Hz.
+    min_loop_dt_s = float(dec.get("min_loop_dt_s", 0.01))
+    loop_dt = max(loop_dt, min_loop_dt_s)
+
+    # Pacing mode:
+    # - Conservative (default): send one move, then wait for estimated motion + settle.
+    #   This strongly prevents queueing but feels "step -> pause -> step".
+    # - Streaming (queue-limited): allow a small amount of planned/queued motion by
+    #   sending short segments frequently. This looks much more gimbal-like.
+    #
+    # To avoid changing existing behavior unexpectedly, streaming is off unless
+    # configured. As a convenience, if loop_hz is set high (>=60), we auto-enable
+    # a modest queue limit unless explicitly provided.
+    queue_limit_s = dec.get("queue_limit_s", None)
+    if queue_limit_s is None:
+        queue_limit_s = 0.25 if loop_hz >= 60.0 else 0.0
+    queue_limit_s = float(queue_limit_s)
+
+    # Streaming segment duration: shorter segments look more continuous.
+    segment_dt_s = float(dec.get("segment_dt_s", 0.05))
+    segment_dt_s = _clamp(segment_dt_s, 0.01, 0.20)
+
+    # Feedforward compensation while moving: subtract predicted camera-induced
+    # offset from measured offsets using the calibration matrix A.
+    motion_feedforward = bool(dec.get("motion_feedforward", True))
 
     speed_scaling = bool(dec.get("speed_scaling", True))
 
@@ -490,14 +531,36 @@ def run_tracker(config_path: Path, *, dry_run: bool, sync: bool) -> int:
     last_face_time = time.time()
     last_print = 0.0
     last_cmd_time = 0.0
+    commanded_until = 0.0
     hold_until = 0.0
     outside_count = 0
     tracking_active = False
 
+    # Estimated in-flight motion state (for feedforward)
+    mot_start_pan = pan
+    mot_start_tilt = tilt
+    mot_target_pan = pan
+    mot_target_tilt = tilt
+    mot_start_t = 0.0
+    mot_end_t = 0.0
+    mot_est_pan = pan
+    mot_est_tilt = tilt
+
     print("=" * 72)
     print("DECOUPLED HEAD TRACKER")
     print(f"UDP port: {cfg['network']['udp_port']} | dry_run={dry_run} | sync={sync}")
-    print(f"deadzone={deadzone} alpha={base_alpha} lookahead={lookahead_s}s")
+    pacing = "stream" if queue_limit_s > 1e-6 else "conservative"
+    print(
+        f"deadzone={deadzone} alpha={base_alpha} lookahead={lookahead_s}s "
+        f"| loop_hz={loop_hz:.1f} (dt={loop_dt*1000:.1f}ms) | pacing={pacing}"
+    )
+    if queue_limit_s > 1e-6:
+        print(
+            f"queue_limit_s={queue_limit_s:.3f} (max queued horizon) "
+            f"segment_dt_s={segment_dt_s:.3f} feedforward={motion_feedforward}"
+        )
+    else:
+        print(f"feedforward={motion_feedforward}")
     det = (dx_dpan * dy_dtilt) - (dx_dtilt * dy_dpan)
     print(
         f"A=[[{dx_dpan:+.6f},{dx_dtilt:+.6f}],[{dy_dpan:+.6f},{dy_dtilt:+.6f}]] det={det:+.6f}"
@@ -509,9 +572,11 @@ def run_tracker(config_path: Path, *, dry_run: bool, sync: bool) -> int:
             loop_start = time.time()
             pkt = receiver.get_latest()
 
-            # If we recently issued a move, optionally ignore correction updates
+            # In conservative pacing, we can optionally ignore correction updates
             # until the move is expected to have settled.
-            if hold_measurements_during_motion and (time.time() < hold_until):
+            # In streaming pacing (queue-limited), we do not hard-hold measurements;
+            # instead we rely on smoothing + queue limiting to keep it stable.
+            if (queue_limit_s <= 1e-6) and hold_measurements_during_motion and (time.time() < hold_until):
                 if pkt is not None and pkt.detected and pkt.confidence >= min_conf:
                     last_face_time = time.time()
                 sleep_s = min(loop_dt, max(0.0, hold_until - time.time()))
@@ -556,12 +621,43 @@ def run_tracker(config_path: Path, *, dry_run: bool, sync: bool) -> int:
                 pred_x = float(pkt.x)
                 pred_y = float(pkt.y)
 
+            # Feedforward: subtract predicted camera-induced shift from the
+            # measured offsets while the motors are moving.
+            if motion_feedforward and (mot_end_t > mot_start_t):
+                now_ff = time.time()
+                if now_ff < mot_end_t:
+                    t = _clamp((now_ff - mot_start_t) / max(1e-6, (mot_end_t - mot_start_t)), 0.0, 1.0)
+                    est_pan = mot_start_pan + (mot_target_pan - mot_start_pan) * t
+                    est_tilt = mot_start_tilt + (mot_target_tilt - mot_start_tilt) * t
+                else:
+                    est_pan = mot_target_pan
+                    est_tilt = mot_target_tilt
+
+                dpan = est_pan - mot_est_pan
+                dtilt = est_tilt - mot_est_tilt
+                mot_est_pan = est_pan
+                mot_est_tilt = est_tilt
+
+                dx_ff = (dx_dpan * dpan) + (dx_dtilt * dtilt)
+                dy_ff = (dy_dpan * dpan) + (dy_dtilt * dtilt)
+                pred_x = _clamp(pred_x - dx_ff, -1.0, 1.0)
+                pred_y = _clamp(pred_y - dy_ff, -1.0, 1.0)
+
             # Light EMA smoothing (reduces tiny sign flips that cause dithering)
             if not filt_init:
                 filt_x, filt_y = pred_x, pred_y
                 filt_init = True
             else:
-                a = _clamp(ema, 0.0, 0.98)
+                # In streaming mode, when we already have some motion queued,
+                # increase EMA (more smoothing) a bit to reduce camera-induced
+                # feedback during motion.
+                a = float(ema)
+                if queue_limit_s > 1e-6:
+                    now = time.time()
+                    queued_s = max(0.0, commanded_until - now)
+                    if queued_s > 1e-6:
+                        a = a + _clamp(queued_s / max(1e-6, queue_limit_s), 0.0, 1.0) * 0.20
+                a = _clamp(a, 0.0, 0.98)
                 filt_x = (a * filt_x) + ((1.0 - a) * pred_x)
                 filt_y = (a * filt_y) + ((1.0 - a) * pred_y)
 
@@ -610,6 +706,15 @@ def run_tracker(config_path: Path, *, dry_run: bool, sync: bool) -> int:
                 time.sleep(loop_dt)
                 continue
 
+            # Streaming mode: also limit how much motion we allow to be queued.
+            # This keeps motion continuous (gimbal-like) without building seconds
+            # of lag in Klipper's queue.
+            if queue_limit_s > 1e-6:
+                queued_s = max(0.0, commanded_until - now)
+                if queued_s >= queue_limit_s:
+                    time.sleep(loop_dt)
+                    continue
+
             # Behavior modulation
             # - close face -> slightly more aggressive
             dist_mult = _clamp(0.5 + pkt.box_size * 2.0, 0.5, 1.5)
@@ -618,6 +723,15 @@ def run_tracker(config_path: Path, *, dry_run: bool, sync: bool) -> int:
 
             alpha = base_alpha * dist_mult * stab_mult
             alpha = _clamp(alpha, 0.2, 1.2)
+
+            # In streaming mode, reduce gain slightly when there is already queued
+            # motion to avoid "chasing" while the camera is in motion.
+            if queue_limit_s > 1e-6:
+                queued_s = max(0.0, commanded_until - time.time())
+                if queued_s > 1e-6:
+                    t_q = _clamp(queued_s / max(1e-6, queue_limit_s), 0.0, 1.0)
+                    alpha *= (1.0 - 0.35 * t_q)
+                    alpha = _clamp(alpha, 0.1, 1.2)
 
             # In position mode, ease off near the center so we settle instead of
             # constantly stepping past the target due to latency/backlash.
@@ -731,10 +845,17 @@ def run_tracker(config_path: Path, *, dry_run: bool, sync: bool) -> int:
                     step_tilt = 0.0
                 elif abs(step_tilt) >= 1e-6:
                     last_tilt_dir = tilt_dir
-            if abs(step_pan) < min_step_pan:
+            eff_min_step_pan = min_step_pan
+            eff_min_step_tilt = min_step_tilt
+            if queue_limit_s > 1e-6:
+                # Allow smaller micro-steps in streaming mode to look continuous.
+                eff_min_step_pan *= 0.25
+                eff_min_step_tilt *= 0.25
+
+            if abs(step_pan) < eff_min_step_pan:
                 target_pan = pan
                 step_pan = 0.0
-            if abs(step_tilt) < min_step_tilt:
+            if abs(step_tilt) < eff_min_step_tilt:
                 target_tilt = tilt
                 step_tilt = 0.0
 
@@ -792,25 +913,44 @@ def run_tracker(config_path: Path, *, dry_run: bool, sync: bool) -> int:
 
             pan, tilt = target_pan, target_tilt
 
-            # Estimate how long the move will take and delay next command accordingly.
-            # Avoids command pileup when SYNC=0.
-            # Use accel-aware estimate when accel is configured; this reduces
-            # mid-move corrections that feel like overshoot.
-            est_pan_t = _estimate_trap_time(step_pan, pan_speed, pan_accel) if pan_accel > 1e-6 else (abs(step_pan) / max(0.01, pan_speed))
-            est_tilt_t = _estimate_trap_time(step_tilt, tilt_speed, tilt_accel) if tilt_accel > 1e-6 else (abs(step_tilt) / max(0.01, tilt_speed))
+            # Estimate how long the move will take.
+            # In streaming mode, accel-aware estimates often create visible pauses
+            # for small segments, so use distance/speed.
+            if queue_limit_s > 1e-6:
+                est_pan_t = abs(step_pan) / max(0.01, pan_speed)
+                est_tilt_t = abs(step_tilt) / max(0.01, tilt_speed)
+            else:
+                est_pan_t = _estimate_trap_time(step_pan, pan_speed, pan_accel) if pan_accel > 1e-6 else (abs(step_pan) / max(0.01, pan_speed))
+                est_tilt_t = _estimate_trap_time(step_tilt, tilt_speed, tilt_accel) if tilt_accel > 1e-6 else (abs(step_tilt) / max(0.01, tilt_speed))
             last_cmd_time = time.time()
             extra_wait = max(est_pan_t, est_tilt_t, move_cooldown_s)
 
-            # Sample-hold: ignore fresh measurements until motion is done and
-            # the image has had a chance to settle.
-            if hold_measurements_during_motion:
+            # Update in-flight motion state for feedforward.
+            if motion_feedforward:
+                mot_start_pan = mot_est_pan
+                mot_start_tilt = mot_est_tilt
+                mot_target_pan = pan
+                mot_target_tilt = tilt
+                mot_start_t = last_cmd_time
+                mot_end_t = last_cmd_time + max(loop_dt, extra_wait)
+
+            # Conservative mode: hard hold until motion + settle.
+            if (queue_limit_s <= 1e-6) and hold_measurements_during_motion:
                 hold_until = last_cmd_time + extra_wait + max(0.0, post_move_settle_s)
+
+            # Track planned/queued motion horizon for streaming mode.
+            if queue_limit_s > 1e-6:
+                # Extend horizon by a fixed segment duration (keeps queue stable).
+                commanded_until = max(commanded_until, last_cmd_time) + max(loop_dt, min(extra_wait, segment_dt_s))
 
             # Maintain loop rate
             elapsed = time.time() - loop_start
-            # If moves are slow, prefer waiting for physical motion rather than
-            # re-reading immediately and reacting to the transient.
-            target_sleep = max(loop_dt, extra_wait)
+            if queue_limit_s > 1e-6:
+                # Streaming: keep the loop cadence; don't sleep for the full move time.
+                target_sleep = loop_dt
+            else:
+                # Conservative: prefer waiting for physical motion to finish.
+                target_sleep = max(loop_dt, extra_wait)
             if elapsed < target_sleep:
                 time.sleep(target_sleep - elapsed)
 
