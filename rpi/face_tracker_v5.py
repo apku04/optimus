@@ -52,6 +52,33 @@ PAN_CENTER = motors_cfg["pan"].get("center", 0.0)
 TILT_CENTER = motors_cfg["tilt"].get("center", 0.0)
 
 # === Tuning parameters ===
+
+""" 
+Key ones to tune:
+
+Parameter	Effect
+SETTLE_TIME	                    ↑ = less oscillation, slower response
+FRESH_MEAS_WAIT	                ↑ = cleaner measurements, slower
+MAX_PAN_STEP / MAX_TILT_STEP	↑ = faster catch-up, may overshoot
+MOVE_SPEED	                    ↑ = faster motor movement
+STEP_GAIN	                    ↑ = more aggressive, may oscillate
+DEADZONE	              ↑ = less jitter when centered, less precise 
+
+# === Tuning parameters ===
+DEADZONE = 0.07           # Don't move if error smaller than this
+EMA_ALPHA = 0.45          # Measurement smoothing (0=responsive, 0.9=smooth)
+MAX_PAN_STEP = 0.25       # Max pan step per cycle (degrees)
+MAX_TILT_STEP = 0.07      # Max tilt step per cycle (degrees)
+STEP_GAIN = 0.28          # How aggressive to chase error
+SETTLE_TIME = 0.12        # Wait after move before measuring (seconds)
+FRESH_MEAS_WAIT = 0.07    # Wait for fresh measurement after settle
+MOVE_SPEED = 15           # Motor speed (deg/sec)
+MOVE_ACCEL = 50           # Motor acceleration (deg/sec^2)
+MIN_CONFIDENCE = 0.5      # Ignore low confidence detections
+LOOP_PERIOD = 0.015       # How often to poll for data
+
+"""
+
 DEADZONE = 0.1           # Don't move if error smaller than this
 EMA_ALPHA = 0.45          # Slightly faster response
 MAX_PAN_STEP = 0.75       # Bigger steps = faster
@@ -59,7 +86,7 @@ MAX_TILT_STEP = 0.17      # Bigger tilt steps
 STEP_GAIN = 0.28          # Slightly more aggressive
 SETTLE_TIME = 0.4         # A bit more settle to avoid oscillation
 FRESH_MEAS_WAIT = 0.07    # Wait for fresh measurement
-MOVE_SPEED = 200           # Faster motor
+MOVE_SPEED = 200          # Faster motor
 MOVE_ACCEL = 50           # Bit more accel
 MIN_CONFIDENCE = 0.5      # Ignore low confidence detections
 LOOP_PERIOD = 0.015       # Faster polling
